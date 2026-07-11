@@ -3,7 +3,7 @@
    Handles: catalog load, category filters, chat, modal
    ══════════════════════════════════════════════════════════ */
 
-const API_BASE = "http://http://34.224.90.177:8000";
+const API_BASE = "http://34.224.90.177:8000";
 
 // ── DOM refs ─────────────────────────────────────────────────
 const productGrid    = document.getElementById("product-grid");
