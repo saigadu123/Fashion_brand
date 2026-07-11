@@ -1,0 +1,22 @@
+ Ignore git files
+.git
+.gitignore
+
+# Ignore Python cache and virtual environment
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env/
+.python-version
+poetry.lock
+# (Keep uv.lock and pyproject.toml in the build context)
+
+
+# Ignore environment file
+.env
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
