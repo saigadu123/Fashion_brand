@@ -1,0 +1,156 @@
+name: FashionBrand — Build & Deploy to AWS ECR / EC2
+
+on:
+  push:
+    branches: [master]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOB 1 — Continuous Integration
+#   • Checks out code
+#   • Authenticates with AWS / ECR
+#   • Builds both Docker images (backend + frontend) using their Dockerfiles
+#   • Tags and pushes each image to its own ECR repository
+# ──────────────────────────────────────────────────────────────────────────────
+jobs:
+  Continuous-Integration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── AWS Auth ─────────────────────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Build & push Backend image ────────────────────────────────────────────
+      - name: Build, tag, and push — Backend
+        id: build-backend
+        env:
+          ECR_REGISTRY:       ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPO_NAME:      ${{ secrets.ECR_REPO_NAME }}
+          IMAGE_TAG:          ${{ github.sha }}
+        run: |
+          docker build \
+            -f Dockerfile \
+            --target backend \
+            -t $ECR_REGISTRY/$ECR_REPO_NAME:backend-$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPO_NAME:backend-latest \
+            .
+
+          docker push $ECR_REGISTRY/$ECR_REPO_NAME:backend-$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPO_NAME:backend-latest
+
+          echo "backend_image=$ECR_REGISTRY/$ECR_REPO_NAME:backend-$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # ── Build & push Frontend image ───────────────────────────────────────────
+      - name: Build, tag, and push — Frontend
+        id: build-frontend
+        env:
+          ECR_REGISTRY:       ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPO_NAME:      ${{ secrets.ECR_REPO_NAME }}
+          IMAGE_TAG:          ${{ github.sha }}
+        run: |
+          docker build \
+            -f Dockerfile \
+            --target frontend \
+            -t $ECR_REGISTRY/$ECR_REPO_NAME:frontend-$IMAGE_TAG \
+            -t $ECR_REGISTRY/$ECR_REPO_NAME:frontend-latest \
+            .
+
+          docker push $ECR_REGISTRY/$ECR_REPO_NAME:frontend-$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPO_NAME:frontend-latest
+
+          echo "frontend_image=$ECR_REGISTRY/$ECR_REPO_NAME:frontend-$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+# ──────────────────────────────────────────────────────────────────────────────
+# JOB 2 — Continuous Deployment
+#   Runs on a self-hosted EC2 runner (GitHub Actions runner pre-installed)
+#   • Pulls the freshly-pushed images from ECR
+#   • Brings up the full stack with docker compose
+# ──────────────────────────────────────────────────────────────────────────────
+  Continuous-Deployment:
+    needs: Continuous-Integration
+    runs-on: self-hosted
+
+    steps:
+      # ── AWS Auth ─────────────────────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── Checkout (needed for docker-compose.yml) ──────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Write runtime secrets to .env ─────────────────────────────────────────
+      # All runtime secrets live in GitHub repo Settings → Secrets and variables.
+      # They are written here to a .env file that docker compose injects at startup.
+      - name: Write runtime .env from GitHub Secrets
+        run: |
+          cat > .env <<EOF
+          GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}
+          MYSQL_HOST=${{ secrets.MYSQL_HOST }}
+          MYSQL_PORT=${{ secrets.MYSQL_PORT }}
+          MYSQL_USER=${{ secrets.MYSQL_USER }}
+          MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_DATABASE=${{ secrets.MYSQL_DATABASE }}
+          EOF
+          # Add any other runtime env vars above this line, e.g.:
+          # SOME_OTHER_SECRET=${{ secrets.SOME_OTHER_SECRET }}
+
+      # ── Tear down any running stack ───────────────────────────────────────────
+      - name: Stop existing containers (if any)
+        run: |
+          docker compose down --remove-orphans || true
+
+      # ── Pull latest images built by CI ───────────────────────────────────────
+      - name: Pull latest images from ECR
+        env:
+          ECR_REGISTRY:      ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPO_NAME:     ${{ secrets.ECR_REPO_NAME }}
+        run: |
+          docker pull $ECR_REGISTRY/$ECR_REPO_NAME:backend-latest
+          docker pull $ECR_REGISTRY/$ECR_REPO_NAME:frontend-latest
+
+      # ── Rewrite image references in docker-compose so it uses ECR images ─────
+      # This overrides the locally-built image names defined in docker-compose.yml
+      # with the freshly-pulled ECR images, then spins up the stack.
+      - name: Deploy with docker compose
+        env:
+          ECR_REGISTRY:      ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPO_NAME:     ${{ secrets.ECR_REPO_NAME }}
+        run: |
+          # Export image overrides so compose.yml picks them up via env substitution
+          export BACKEND_IMAGE=$ECR_REGISTRY/$ECR_REPO_NAME:backend-latest
+          export FRONTEND_IMAGE=$ECR_REGISTRY/$ECR_REPO_NAME:frontend-latest
+
+          docker compose \
+            -f docker-compose.yml \
+            up -d --no-build
+
+      # ── Health check ──────────────────────────────────────────────────────────
+      - name: Wait and verify containers are running
+        run: |
+          sleep 10
+          docker compose ps
+          docker logs fashion-backend  --tail 20 || true
+          docker logs fashion-frontend --tail 20 || true
